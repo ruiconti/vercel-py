@@ -1,6 +1,7 @@
 """Internal Sandbox API client."""
 
 import json
+import os
 import platform
 import sys
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -22,6 +23,7 @@ from pydantic import (
     field_validator,
 )
 
+from vercel._internal.core.detect_agent import detect_agent_name
 from vercel._internal.core.http import (
     NO_TIMEOUT,
     BaseTransport,
@@ -98,9 +100,44 @@ except PackageNotFoundError:
         VERSION = "development"
 
 PLATFORM = platform.uname()
-USER_AGENT = (
-    f"vercel-sandbox/{VERSION} (Python/{sys.version}; {PLATFORM.system}/{PLATFORM.machine})"
-)
+
+
+@dataclass(frozen=True, slots=True)
+class _SandboxUserAgent:
+    client_version: str
+    python_version: str
+    platform_system: str
+    platform_machine: str
+    agent_name: str | None = None
+
+    @classmethod
+    def from_environment(cls) -> "_SandboxUserAgent":
+        agent_name = None
+        if not (
+            os.environ.get("VERCEL_TELEMETRY_DISABLED")
+            or os.environ.get("VERCEL_SANDBOX_TELEMETRY_DISABLED")
+        ):
+            agent_name = detect_agent_name()
+        return cls(
+            client_version=VERSION,
+            python_version=sys.version,
+            platform_system=PLATFORM.system,
+            platform_machine=PLATFORM.machine,
+            agent_name=agent_name,
+        )
+
+    def __str__(self) -> str:
+        package_info = f"vercel-sandbox/{self.client_version}"
+        agent_info = f" agent/{self.agent_name}" if self.agent_name else ""
+        python_info = f"Python/{self.python_version}"
+        system_info = f"{self.platform_system}/{self.platform_machine}"
+        return f"{package_info}{agent_info} ({python_info}; {system_info})"
+
+
+def _user_agent() -> str:
+    return str(_SandboxUserAgent.from_environment())
+
+
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
 
 
@@ -964,7 +1001,7 @@ class SandboxApiClient:
             ),
         )
         request_headers = {
-            "user-agent": USER_AGENT,
+            "user-agent": _user_agent(),
             **dict(headers or {}),
         }
         response = await self._transport.send(
@@ -1005,7 +1042,7 @@ class SandboxApiClient:
             ),
         )
         request_headers = {
-            "user-agent": USER_AGENT,
+            "user-agent": _user_agent(),
             **dict(headers or {}),
         }
         response = await self._transport.open_response_stream(
@@ -1888,7 +1925,7 @@ class SandboxApiClient:
             token=credentials.token,
             params=query,
             headers={
-                "user-agent": USER_AGENT,
+                "user-agent": _user_agent(),
                 "x-cwd": "/",
                 "content-type": "application/gzip",
             },
