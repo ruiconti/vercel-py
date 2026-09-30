@@ -1,17 +1,17 @@
-"""Detect coding agents from the environment of the current process.
+"""Detect coding agents from the environment and filesystem of the current process.
 
-The checks mirror the environment-variable rules in @vercel/detect-agent 1.2.5.
-Its filesystem-based Devin check is intentionally outside this utility's scope.
+The checks mirror @vercel/detect-agent 1.2.5.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from os.path import exists
 
 
 def detect_agent_name(environ: Mapping[str, str] | None = None) -> str | None:
-    """Return the agent driving this process, if its environment identifies one."""
+    """Return the agent driving this process, if detected."""
     env = os.environ if environ is None else environ
 
     declared = env.get("AI_AGENT", "").strip()
@@ -42,4 +42,6 @@ def detect_agent_name(environ: Mapping[str, str] | None = None) -> str | None:
         env.get(name) for name in ("COPILOT_MODEL", "COPILOT_ALLOW_ALL", "COPILOT_GITHUB_TOKEN")
     ):
         return "github-copilot"
+    if exists("/opt/.devin"):
+        return "devin"
     return None

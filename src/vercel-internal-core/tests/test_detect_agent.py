@@ -1,10 +1,21 @@
-"""Tests for coding-agent detection from inherited environment variables."""
+"""Tests for coding-agent detection from environment and filesystem markers."""
+
+from unittest.mock import Mock
 
 import pytest
 
+from vercel._internal.core import detect_agent
 from vercel._internal.core.detect_agent import detect_agent_name
 
 
+@pytest.fixture(autouse=True)
+def devin_path_exists(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    exists = Mock(return_value=False)
+    monkeypatch.setattr(detect_agent, "exists", exists)
+    return exists
+
+
+@pytest.mark.parametrize("path_exists", [False, True])
 @pytest.mark.parametrize(
     ("environment", "agent"),
     [
@@ -26,14 +37,20 @@ from vercel._internal.core.detect_agent import detect_agent_name
         ({"COPILOT_GITHUB_TOKEN": "token"}, "github-copilot"),
     ],
 )
-def test_known_agent_environment_markers(environment: dict[str, str], agent: str) -> None:
+def test_known_agent_environment_markers(
+    environment: dict[str, str], agent: str, path_exists: bool, devin_path_exists: Mock
+) -> None:
+    devin_path_exists.return_value = path_exists
     assert detect_agent_name(environment) == agent
+    devin_path_exists.assert_not_called()
 
 
-def test_ai_agent_takes_precedence_and_preserves_custom_names() -> None:
+def test_ai_agent_takes_precedence_and_preserves_custom_names(devin_path_exists: Mock) -> None:
+    devin_path_exists.return_value = True
     assert detect_agent_name({"AI_AGENT": " custom-agent@2 ", "CODEX_THREAD_ID": "thread"}) == (
         "custom-agent@2"
     )
+    devin_path_exists.assert_not_called()
 
 
 def test_copilot_cli_name_is_normalized() -> None:
@@ -46,6 +63,15 @@ def test_empty_ai_agent_falls_back_to_known_marker() -> None:
 
 def test_no_agent_when_environment_has_no_matching_marker() -> None:
     assert detect_agent_name({"AI_AGENT": " ", "CURSOR_AGENT": ""}) is None
+
+
+@pytest.mark.parametrize(("path_exists", "agent"), [(True, "devin"), (False, None)])
+def test_devin_filesystem_marker(
+    path_exists: bool, agent: str | None, devin_path_exists: Mock
+) -> None:
+    devin_path_exists.return_value = path_exists
+    assert detect_agent_name({}) == agent
+    devin_path_exists.assert_called_once_with("/opt/.devin")
 
 
 def test_first_matching_known_marker_wins() -> None:
