@@ -15,8 +15,10 @@ from typing import Any
 import pytest
 
 from tests.payloads import PLAIN_ENCODER
+from tests.workflow_context import bind_context
 from vercel.workflow._internal import (
     core,
+    errors,
     loop as workflow_loop,
     runtime,
     serialization as ser,
@@ -29,7 +31,7 @@ async def _greet(*, name: str) -> str:
 
 
 @dataclasses.dataclass
-class _HookPayload:
+class _HookPayload(core.BaseHook):
     value: str
 
 
@@ -63,7 +65,8 @@ def _resume_isolated(ctx: runtime.WorkflowOrchestratorContext) -> None:
     """
 
     async def body() -> None:
-        ctx.resume()
+        with bind_context(ctx):
+            ctx.resume()
 
     try:
         runtime._run_isolated(body(), loop_factory=asyncio.new_event_loop)
@@ -149,7 +152,8 @@ async def test_changed_hook_token_raises_nondeterminism(conflict: bool, disposed
     hook = ctx.hooks[hook_id]
     ctx.events.append(_hook_registration_event(hook_id, "old-token", conflict=conflict))
     if disposed:
-        ctx.dispose_hook(correlation_id=hook_id)
+        with bind_context(ctx):
+            ctx.dispose_hook(correlation_id=hook_id)
 
     _resume_isolated(ctx)
 
@@ -169,7 +173,8 @@ async def test_unchanged_hook_token_replays_normally(conflict: bool) -> None:
     hook = ctx.hooks[hook_id]
     ctx.events.append(_hook_registration_event(hook_id, "same-token", conflict=conflict))
 
-    ctx.resume()
+    with bind_context(ctx):
+        ctx.resume()
 
     assert ctx.resume_exception is None
     assert not ctx.suspended
@@ -195,7 +200,8 @@ async def test_received_hook_token_mismatch_fails_before_delivery(
         ).into_event(hook_id)
     )
     if disposed:
-        ctx.dispose_hook(correlation_id=hook_id)
+        with bind_context(ctx):
+            ctx.dispose_hook(correlation_id=hook_id)
 
     _resume_isolated(ctx)
 
@@ -217,7 +223,8 @@ async def test_received_hook_with_missing_or_matching_token_delivers_payload(
         ).into_event(hook_id)
     )
 
-    ctx.resume()
+    with bind_context(ctx):
+        ctx.resume()
 
     assert ctx.resume_exception is None
     assert not ctx.suspended
@@ -229,7 +236,8 @@ async def test_hook_disposal_without_event_data_skips_token_validation() -> None
     hook_id = ctx.create_hook("current-token", _HookPayload)._correlation_id
     ctx.events.append(w.HookDisposedEvent(correlation_id=hook_id))
 
-    ctx.resume()
+    with bind_context(ctx):
+        ctx.resume()
 
     assert ctx.resume_exception is None
     assert ctx.hooks[hook_id].has_dispose_event
@@ -258,19 +266,21 @@ def _completed(cid: str, result: Any) -> w.Event:
     return w.StepCompletedEventData(result=PLAIN_ENCODER.encode(result)).into_event(cid)
 
 
-async def test_cancelled_step_ignores_later_completion() -> None:
+@pytest.mark.parametrize("result", [PLAIN_ENCODER.encode("one"), b"invalid payload"])
+async def test_cancelled_step_ignores_later_completion(result: bytes) -> None:
     """A step can be cancelled before its completion is replayed.
 
     The completion event still needs to be consumed, but setting a result on
     the cancelled future would raise ``InvalidStateError``.
     """
-    events: list[w.Event] = [_completed("step_1", "one")]
+    events: list[w.Event] = [w.StepCompletedEventData(result=result).into_event("step_1")]
     ctx = _context(events)
     sus = _suspension("step_1", _ARGS)
     ctx.suspensions["step_1"] = sus
 
     assert sus.future.cancel()
-    ctx.resume()
+    with bind_context(ctx):
+        ctx.resume()
 
     assert sus.future.cancelled()
     assert "step_1" not in ctx.suspensions
@@ -289,7 +299,8 @@ async def test_single_step_delivers_one_completion_per_pass() -> None:
     ctx.suspensions["step_1"] = sus1
     ctx.suspensions["step_2"] = sus2
 
-    ctx.resume()
+    with bind_context(ctx):
+        ctx.resume()
 
     # exactly one completion delivered; its suspension consumed...
     assert sus1.future.done() and sus1.future.result() == "one"
@@ -317,7 +328,8 @@ async def test_workflow_loop_runs_pending_work_before_resume() -> None:
 
     def resume() -> None:
         assert pending_ran
-        ctx.resume()
+        with bind_context(ctx):
+            ctx.resume()
 
     class Workflow:
         def resume(self) -> None:
@@ -354,7 +366,7 @@ async def test_idle_resume_parks_when_nothing_to_deliver() -> None:
     async def wait_forever() -> None:
         await asyncio.Future()
 
-    with pytest.raises(asyncio.CancelledError):
+    with bind_context(ctx), pytest.raises(asyncio.CancelledError):
         runtime._run_isolated(
             wait_forever(),
             loop_factory=lambda: workflow_loop.WorkflowLoop(workflow=ctx),
@@ -398,6 +410,70 @@ async def _reraising() -> str:
         return await _record(name="b")
     except BaseException:  # noqa: B036
         raise runtime.NondeterminismError("surfaced by the body") from None
+
+
+@_run_registry.workflow
+async def _catch_step_error() -> str:
+    try:
+        return await _record(name="a")
+    except errors.FatalError as error:
+        return str(error)
+
+
+@_run_registry.workflow
+async def _unawaited_record(fail: bool = False) -> str:
+    ctx = runtime.WorkflowOrchestratorContext.current()
+    pending = ctx.run_step(_record, name="a")
+    # Completing historical operations after the body finishes must not start
+    # user continuations. The isolated loop has already shut down by then.
+    pending.add_done_callback(lambda _: ctx.run_step(_record, name="unexpected continuation"))
+    if fail:
+        raise ValueError("body failed")
+    return "done"
+
+
+@_run_registry.workflow
+async def _unawaited_wait_and_attributes() -> str:
+    ctx = runtime.WorkflowOrchestratorContext.current()
+    pending = [
+        ctx.run_wait(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        ctx.set_attributes([w.AttributeChange(key="phase", value="done")], allow_reserved=False),
+    ]
+    for future in pending:
+        future.add_done_callback(lambda _: ctx.run_step(_record, name="unexpected continuation"))
+    return "done"
+
+
+@_run_registry.workflow
+async def _operation_from_task_cleanup() -> str:
+    async def background() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            runtime.WorkflowOrchestratorContext.current().run_step(_record, name="a")
+
+    asyncio.create_task(background())
+    await asyncio.sleep(0)
+    return "done"
+
+
+@_run_registry.workflow
+async def _no_operations() -> str:
+    return "done"
+
+
+@_run_registry.workflow
+async def _unawaited_hook(token: str) -> str:
+    hook = _HookPayload.wait(token=token)
+
+    async def consume() -> None:
+        await hook
+        await _record(name="unexpected continuation")
+
+    asyncio.create_task(consume())
+    asyncio.create_task(hook.get_conflict())
+    await asyncio.sleep(0)
+    return "done"
 
 
 def _running_run(workflow_id: str) -> w.WorkflowRun:
@@ -447,6 +523,244 @@ async def test_nondeterminism_cannot_be_suppressed_by_the_body() -> None:
         ctx.run_workflow(_running_run(_suppressing.workflow_id))
 
 
+@pytest.mark.parametrize("outcome", ["result", "error"])
+async def test_workflow_catches_unreadable_step_outcome(outcome: str) -> None:
+    cid = f"step_{_context([]).generate_ulid()}"
+    event = (
+        w.StepCompletedEventData(result=b"invalid payload").into_event(cid)
+        if outcome == "result"
+        else w.StepFailedEventData(error=b"invalid payload").into_event(cid)
+    )
+    ctx = runtime.WorkflowOrchestratorContext(
+        [_created(_record, cid), event],
+        run_id="wrun_test",
+        seed="wrun_test",
+        started_at=0,
+        registry=_run_registry,
+    )
+
+    output = ctx.run_workflow(_running_run(_catch_step_error.workflow_id))
+    message = ser.hydrate(output, what="the workflow result")
+
+    assert message.startswith(f"Cannot read the {outcome} of step {cid}:")
+    assert "unknown serialization format" in message
+    assert ctx.replay_index == len(ctx.events)
+    assert not ctx.suspensions
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("outcome", ["pending", "completed", "failed", "unreadable_result"])
+async def test_terminal_replay_applies_unawaited_operation_history(fail, outcome) -> None:
+    cid = f"step_{_context([]).generate_ulid()}"
+    events = [_created(_record, cid)]
+    if outcome == "completed":
+        events.append(_completed(cid, "recorded result"))
+    elif outcome == "failed":
+        events.append(
+            w.StepFailedEventData(
+                error=PLAIN_ENCODER.encode_error(ValueError("step failed"))
+            ).into_event(cid)
+        )
+    elif outcome == "unreadable_result":
+        # Terminal replay must skip decoding as well as future notification.
+        events.append(w.StepCompletedEventData(result=b"invalid payload").into_event(cid))
+    ctx = runtime.WorkflowOrchestratorContext(
+        events, run_id="wrun_test", seed="wrun_test", started_at=0, registry=_run_registry
+    )
+    run = _running_run(_unawaited_record.workflow_id).model_copy(
+        update={"input": PLAIN_ENCODER.encode(ser.argument_array((fail,), {}))}
+    )
+
+    if fail:
+        with pytest.raises(ValueError, match="body failed"):
+            ctx.run_workflow(run)
+    else:
+        assert ctx.run_workflow(run) == PLAIN_ENCODER.encode("done")
+
+    assert ctx.replay_index == len(events)
+    assert not ctx.suspended
+    assert set(ctx.suspensions) == ({cid} if outcome == "pending" else set())
+    if outcome == "pending":
+        assert ctx.suspensions[cid].has_created_event
+
+
+@pytest.mark.parametrize("diverged", [False, True])
+async def test_terminal_replay_applies_waits_and_validates_attributes(diverged) -> None:
+    probe = _context([])
+    wait_id = f"wait_{probe.generate_ulid()}"
+    attr_id = f"attr_{probe.generate_ulid()}"
+    events: list[w.Event] = [
+        w.WaitCreatedEventData(resume_at=datetime(2026, 1, 1, tzinfo=timezone.utc)).into_event(
+            wait_id
+        ),
+        w.WaitCompletedEvent(correlation_id=wait_id),
+        w.AttrSetEventData(
+            changes=[w.AttributeChange(key="phase", value="other" if diverged else "done")],
+            writer=w.WorkflowAttributeWriter(),
+        ).into_event(attr_id),
+    ]
+    ctx = runtime.WorkflowOrchestratorContext(
+        events, run_id="wrun_test", seed="wrun_test", started_at=0, registry=_run_registry
+    )
+    run = _running_run(_unawaited_wait_and_attributes.workflow_id)
+
+    if diverged:
+        with pytest.raises(runtime.NondeterminismError, match="recorded attributes"):
+            ctx.run_workflow(run)
+    else:
+        assert ctx.run_workflow(run) == PLAIN_ENCODER.encode("done")
+
+    assert ctx.replay_index == len(events)
+    assert not ctx.suspensions
+    await asyncio.sleep(0)
+
+
+async def test_terminal_replay_runs_after_task_cleanup() -> None:
+    cid = f"step_{_context([]).generate_ulid()}"
+    events = [_created(_record, cid), _completed(cid, "recorded result")]
+    ctx = runtime.WorkflowOrchestratorContext(
+        events, run_id="wrun_test", seed="wrun_test", started_at=0, registry=_run_registry
+    )
+
+    assert ctx.run_workflow(_running_run(_operation_from_task_cleanup.workflow_id)) == (
+        PLAIN_ENCODER.encode("done")
+    )
+    assert ctx.replay_index == len(events)
+    assert not ctx.suspended
+    assert not ctx.suspensions
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_terminal_replay_validates_unawaited_operation_input(fail) -> None:
+    cid = f"step_{_context([]).generate_ulid()}"
+    event = w.StepCreatedEventData(step_name=_record.name, input=_args(name="other")).into_event(
+        cid
+    )
+    ctx = runtime.WorkflowOrchestratorContext(
+        [event], run_id="wrun_test", seed="wrun_test", started_at=0, registry=_run_registry
+    )
+    run = _running_run(_unawaited_record.workflow_id).model_copy(
+        update={"input": PLAIN_ENCODER.encode(ser.argument_array((fail,), {}))}
+    )
+
+    with pytest.raises(runtime.NondeterminismError, match="different arguments"):
+        ctx.run_workflow(run)
+
+    # Terminal validation runs outside the isolated loop. It must not cancel
+    # tasks in the caller's event loop when it finds a divergence.
+    await asyncio.sleep(0)
+
+
+async def test_terminal_replay_rejects_an_operation_the_body_no_longer_declares() -> None:
+    cid = f"step_{_context([]).generate_ulid()}"
+    ctx = runtime.WorkflowOrchestratorContext(
+        [_created(_record, cid)],
+        run_id="wrun_test",
+        seed="wrun_test",
+        started_at=0,
+        registry=_run_registry,
+    )
+
+    with pytest.raises(runtime.NondeterminismError, match="has not registered"):
+        ctx.run_workflow(_running_run(_no_operations.workflow_id))
+
+
+@pytest.mark.parametrize("outcome", ["created", "conflict", "received", "disposed"])
+async def test_terminal_replay_applies_hook_history_after_task_cleanup(outcome: str) -> None:
+    cid = f"hook_{_context([]).generate_ulid()}"
+    events = [_hook_registration_event(cid, "same-token", conflict=outcome == "conflict")]
+    if outcome in {"received", "disposed"}:
+        events.append(
+            w.HookReceivedEventData(
+                token="same-token", payload=PLAIN_ENCODER.encode({"value": "recorded payload"})
+            ).into_event(cid)
+        )
+    if outcome == "disposed":
+        events.append(w.HookDisposedEvent(correlation_id=cid))
+    ctx = runtime.WorkflowOrchestratorContext(
+        events, run_id="wrun_test", seed="wrun_test", started_at=0, registry=_run_registry
+    )
+    run = _running_run(_unawaited_hook.workflow_id).model_copy(
+        update={"input": PLAIN_ENCODER.encode(ser.argument_array(("same-token",), {}))}
+    )
+
+    assert ctx.run_workflow(run) == PLAIN_ENCODER.encode("done")
+
+    hook = ctx.hooks[cid]
+    assert ctx.replay_index == len(events)
+    assert not ctx.suspended
+    assert hook.has_created_event == (outcome != "conflict")
+    assert (hook.conflict_error is not None) == (outcome == "conflict")
+    assert hook.has_dispose_event == (outcome == "disposed")
+    assert not hook.buffered_results
+    assert set(ctx.suspensions) == ({cid} if outcome in {"created", "received"} else set())
+    await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("outcome", ["created", "conflict", "received", "disposed"])
+async def test_terminal_hook_history_does_not_signal_waiters_on_a_closed_loop(outcome) -> None:
+    ctx = _context([])
+    hook_event = ctx.create_hook("same-token", _HookPayload)
+    cid = hook_event._correlation_id
+    hook = ctx.hooks[cid]
+    ctx.events.append(_hook_registration_event(cid, "same-token", conflict=outcome == "conflict"))
+    if outcome == "received":
+        ctx.events.append(
+            w.HookReceivedEventData(
+                token="same-token", payload=PLAIN_ENCODER.encode({"value": "recorded payload"})
+            ).into_event(cid)
+        )
+    elif outcome == "disposed":
+        ctx.events.append(w.HookDisposedEvent(correlation_id=cid))
+
+    # A task spawned during shutdown can leave a waiter on the closed loop.
+    # Keep a callback attached so resolving it would try to schedule user code.
+    isolated_loop = asyncio.new_event_loop()
+    try:
+        future = isolated_loop.create_future()
+        future.add_done_callback(lambda _: None)
+        hook.futures.append(future)
+        conflict_future = isolated_loop.create_future()
+        conflict_future.add_done_callback(lambda _: None)
+        hook.conflict_futures.append(conflict_future)
+    finally:
+        isolated_loop.close()
+
+    with bind_context(ctx):
+        ctx._finish_replay()
+
+    assert ctx.replay_index == len(ctx.events)
+    assert hook.has_created_event == (outcome != "conflict")
+    assert (hook.conflict_error is not None) == (outcome == "conflict")
+    assert hook.has_dispose_event == (outcome == "disposed")
+    assert hook.disposed == (outcome == "disposed")
+    assert set(ctx.suspensions) == ({cid} if outcome in {"created", "received"} else set())
+    assert not hook.buffered_results
+    assert not future.done()
+    assert not conflict_future.done()
+
+
+@pytest.mark.parametrize("conflict", [False, True], ids=["created", "conflict"])
+async def test_terminal_replay_validates_hook_tokens(conflict: bool) -> None:
+    cid = f"hook_{_context([]).generate_ulid()}"
+    ctx = runtime.WorkflowOrchestratorContext(
+        [_hook_registration_event(cid, "old-token", conflict=conflict)],
+        run_id="wrun_test",
+        seed="wrun_test",
+        started_at=0,
+        registry=_run_registry,
+    )
+    run = _running_run(_unawaited_hook.workflow_id).model_copy(
+        update={"input": PLAIN_ENCODER.encode(ser.argument_array(("new-token",), {}))}
+    )
+
+    with pytest.raises(runtime.NondeterminismError, match="recorded hook token 'old-token'"):
+        ctx.run_workflow(run)
+
+    assert not ctx.suspended
+    await asyncio.sleep(0)
+
+
 # --- now(): deterministic clock anchored to replay progress, not list tail ------
 
 
@@ -490,10 +804,11 @@ async def test_now_advances_with_replay_index() -> None:
     sus1 = _suspension("step_1", _ARGS)
     ctx.suspensions["step_1"] = sus1
 
-    for _ in events:
-        ctx.resume()
-        if sus1.future.done():
-            break
+    with bind_context(ctx):
+        for _ in events:
+            ctx.resume()
+            if sus1.future.done():
+                break
 
     assert sus1.future.done() and sus1.future.result() == "one"
     assert ctx.now() == t1

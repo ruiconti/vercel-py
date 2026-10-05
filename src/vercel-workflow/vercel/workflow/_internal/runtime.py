@@ -117,10 +117,23 @@ class BaseSuspension(abc.ABC):
     def fail(self, exc: Exception) -> None:
         """Resume this suspension by raising ``exc`` in its awaiter."""
 
+    @staticmethod
+    def _unfinished_context() -> WorkflowOrchestratorContext | None:
+        ctx = WorkflowOrchestratorContext.current()
+        if ctx.finished:
+            return None
+        return ctx
+
 
 @dataclasses.dataclass(kw_only=True)
 class FutureSuspension(BaseSuspension, Generic[T]):
     future: asyncio.Future[T] = dataclasses.field(default_factory=asyncio.Future)
+
+    def set_result(self, result: T) -> None:
+        if self._unfinished_context() is None:
+            return
+        if not self.future.cancelled():
+            self.future.set_result(result)
 
     def fail(self, exc: Exception) -> None:
         if not self.future.done():
@@ -131,6 +144,33 @@ class FutureSuspension(BaseSuspension, Generic[T]):
 class Suspension(FutureSuspension[T], Generic[T]):
     step: core.Step[Any, T]
     input: bytes
+
+    def receive_outcome(self, data: bytes, *, is_error: bool) -> None:
+        ctx = self._unfinished_context()
+        if ctx is None:
+            return
+        what = f"the {'error' if is_error else 'result'} of step {self.correlation_id}"
+        failure: Exception
+        try:
+            if is_error:
+                failure = ser.hydrate_error(data, what=what, key=ctx.run_key)
+            else:
+                result = ser.hydrate(data, what=what, key=ctx.run_key)
+                if not self.future.cancelled():
+                    self.future.set_result(self.step.codec.validate_return(result))
+                return
+        except ser.SerializationError as error:
+            failure = errors.FatalError(f"Cannot read {what}: {error}")
+        except signature_codec.TypeValidationError as error:
+            failure = error
+        if not self.future.cancelled():
+            if isinstance(failure, errors.StepCancelledError) and isinstance(
+                self.future, CallbackCancelFuture
+            ):
+                # Died from the body's own cancellation: deliver it as one.
+                self.future.deliver_cancellation(str(failure))
+            else:
+                self.future.set_exception(failure)
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -221,8 +261,16 @@ class Hook(BaseSuspension, Generic[T]):
             if not conflict_future.done():
                 conflict_future.set_exception(exc)
 
-    def set_result(self, raw_data: Any) -> None:
+    def receive_payload(self, payload: bytes) -> None:
+        ctx = self._unfinished_context()
+        if ctx is None:
+            return
         try:
+            raw_data = ser.hydrate(
+                payload,
+                what=f"the payload of hook {self.correlation_id}",
+                key=ctx.run_key,
+            )
             res: T
             if dataclasses.is_dataclass(self.hook_cls):
                 res = self.hook_cls(**raw_data)
@@ -231,18 +279,47 @@ class Hook(BaseSuspension, Generic[T]):
             else:
                 raise RuntimeError(f"Invalid hook type for {self.hook_cls}")
         except Exception as error:
-            self.set_error(error)
+            if (future := self._next_waiter()) is not None:
+                future.set_exception(error)
+            else:
+                self.buffered_results.append(error)
         else:
             if (future := self._next_waiter()) is not None:
                 future.set_result(res)
             else:
                 self.buffered_results.append((res,))
 
-    def set_error(self, error: Exception) -> None:
-        if (future := self._next_waiter()) is not None:
-            future.set_exception(error)
-        else:
-            self.buffered_results.append(error)
+    def notify_created(self) -> None:
+        if self._unfinished_context() is None:
+            return
+        while self.conflict_futures:
+            future = self.conflict_futures.popleft()
+            if not future.cancelled():
+                future.set_result(None)
+
+    def notify_conflict(self, token: str, conflicting_run_id: str | None) -> None:
+        conflict_error = errors.HookConflictError(token, conflicting_run_id)
+        self.conflict_error = conflict_error
+        self.conflicting_run = Run(conflicting_run_id) if conflicting_run_id else None
+        if self._unfinished_context() is None:
+            return
+        while (future := self._next_waiter()) is not None:
+            future.set_exception(conflict_error)
+        while self.conflict_futures:
+            conflict_future = self.conflict_futures.popleft()
+            if conflict_future.cancelled():
+                continue
+            if self.conflicting_run is not None:
+                conflict_future.set_result(self.conflicting_run)
+            else:
+                # Older conflict events do not identify the owning run.
+                conflict_future.set_exception(conflict_error)
+
+    def notify_disposed(self) -> None:
+        if self._unfinished_context() is None:
+            return
+        while (future := self._next_waiter()) is not None:
+            future.set_exception(StopAsyncIteration)
 
     def _next_waiter(self) -> asyncio.Future[T] | None:
         while self.futures:
@@ -833,6 +910,7 @@ class WorkflowOrchestratorContext:
         self.registry = registry
 
         self.suspended = False
+        self.finished = False
         # An error the run must fail with regardless of what the body does;
         # raised by run_workflow(). See _fail_nondeterminism.
         self.resume_exception: Exception | None = None
@@ -922,14 +1000,18 @@ class WorkflowOrchestratorContext:
 
             token = self._ctx.set(self)
             try:
-                result = self.payload_encoder.encode(
-                    obj.codec.dump_return(
-                        _run_isolated(
-                            obj.func(*args, **kwargs),
-                            loop_factory=lambda: loop.WorkflowLoop(workflow=self),
+                try:
+                    result = self.payload_encoder.encode(
+                        obj.codec.dump_return(
+                            _run_isolated(
+                                obj.func(*args, **kwargs),
+                                loop_factory=lambda: loop.WorkflowLoop(workflow=self),
+                            )
                         )
                     )
-                )
+                finally:
+                    if not self.suspended:
+                        self._finish_replay()
             except BaseException as ex:
                 if self.resume_exception is not None:
                     # Since resume_exception actually got raised on a
@@ -1101,10 +1183,7 @@ class WorkflowOrchestratorContext:
     def dispose_hook(self, *, correlation_id: str) -> None:
         hook = self.hooks[correlation_id]
         hook.disposed = True
-        while hook.futures:
-            fut = hook.futures.popleft()
-            if not fut.done():
-                fut.set_exception(StopAsyncIteration)
+        hook.notify_disposed()
         self.suspensions.pop(correlation_id, None)
 
     def _fail_nondeterminism(self, sus: BaseSuspension | None, exc: Exception) -> None:
@@ -1114,9 +1193,11 @@ class WorkflowOrchestratorContext:
         on, so failing its future alone might never surface anywhere -- and a
         body that is awaiting it could catch the error. So the exception is
         also stashed for ``run_workflow`` to raise, and the run is suspended
-        so nothing else executes.
+        so nothing else executes. During finalization, raise directly instead.
         """
         self.resume_exception = exc
+        if self.finished:
+            raise exc
         if sus is not None:
             sus.fail(exc)
         self.suspend()
@@ -1152,6 +1233,14 @@ class WorkflowOrchestratorContext:
         # multiple deliveries bunched up before a resume(), which could
         # lead to mismatches between a recording trace and a replaying
         # one.
+        self._replay_next_event()
+
+    def _finish_replay(self) -> None:
+        self.finished = True
+        while self.replay_index < len(self.events):
+            self._replay_next_event()
+
+    def _replay_next_event(self) -> None:
         event = self.events[self.replay_index]
         self.replay_index += 1
         if event.correlation_id in self.hooks:
@@ -1247,10 +1336,7 @@ class WorkflowOrchestratorContext:
                     hook = self.suspensions[event.correlation_id]
                 hook.has_created_event = True
                 if isinstance(hook, Hook):
-                    while hook.conflict_futures:
-                        future = hook.conflict_futures.popleft()
-                        if not future.cancelled():
-                            future.set_result(None)
+                    hook.notify_created()
                 else:
                     assert isinstance(hook, Cancellation)
 
@@ -1273,48 +1359,22 @@ class WorkflowOrchestratorContext:
                         ),
                     )
                     return
-                if not attr_sus.future.cancelled():
-                    attr_sus.future.set_result(None)
+                attr_sus.set_result(None)
 
             case w.StepCompletedEvent(event_data=w.StepCompletedEventData(result=data)):
                 sus = self.suspensions.pop(event.correlation_id)
                 assert isinstance(sus, Suspension)
-                result = ser.hydrate(
-                    data,
-                    what=f"the result of step {event.correlation_id}",
-                    key=self.run_key,
-                )
-                if not sus.future.cancelled():
-                    try:
-                        validated = sus.step.codec.validate_return(result)
-                    except signature_codec.TypeValidationError as error:
-                        sus.future.set_exception(error)
-                    else:
-                        sus.future.set_result(validated)
+                sus.receive_outcome(data, is_error=False)
 
             case w.WaitCompletedEvent():
                 wait = self.suspensions.pop(event.correlation_id)
                 assert isinstance(wait, Wait)
-                if not wait.future.cancelled():
-                    wait.future.set_result(None)
+                wait.set_result(None)
 
             case w.StepFailedEvent(event_data=w.StepFailedEventData(error=data)):
                 sus = self.suspensions.pop(event.correlation_id)
                 assert isinstance(sus, Suspension)
-                what = f"the error of step {event.correlation_id}"
-                try:
-                    failure = ser.hydrate_error(data, what=what, key=self.run_key)
-                except ser.SerializationError as error:
-                    failure = errors.FatalError(f"Cannot read {what}: {error}")
-                if not sus.future.cancelled():
-                    if isinstance(failure, errors.StepCancelledError) and isinstance(
-                        sus.future, CallbackCancelFuture
-                    ):
-                        # Died from the body's own cancellation: deliver it
-                        # as one.
-                        sus.future.deliver_cancellation(str(failure))
-                    else:
-                        sus.future.set_exception(failure)
+                sus.receive_outcome(data, is_error=True)
 
             case w.HookConflictEvent(
                 event_data=w.HookConflictEventData(
@@ -1325,25 +1385,7 @@ class WorkflowOrchestratorContext:
                 conflicting_hook = self.hooks.get(event.correlation_id)
                 if conflicting_hook is not None:
                     self.suspensions.pop(event.correlation_id, None)
-                    conflict_error = errors.HookConflictError(token, conflicting_run_id)
-                    conflicting_hook.conflict_error = conflict_error
-                    conflicting_hook.conflicting_run = (
-                        Run(conflicting_run_id) if conflicting_run_id else None
-                    )
-                    while conflicting_hook.futures:
-                        future = conflicting_hook.futures.popleft()
-                        if not future.cancelled():
-                            future.set_exception(conflict_error)
-                    while conflicting_hook.conflict_futures:
-                        future = conflicting_hook.conflict_futures.popleft()
-                        if future.cancelled():
-                            continue
-                        if conflicting_hook.conflicting_run is not None:
-                            future.set_result(conflicting_hook.conflicting_run)
-                        else:
-                            # Older conflict events do not identify the owning run, so preserve the
-                            # previous HookConflictError behavior when a Run cannot be constructed.
-                            future.set_exception(conflict_error)
+                    conflicting_hook.notify_conflict(token, conflicting_run_id)
 
             case w.HookReceivedEvent(event_data=w.HookReceivedEventData(payload=data)):
                 hook = self.suspensions.get(event.correlation_id)
@@ -1357,16 +1399,7 @@ class WorkflowOrchestratorContext:
                     return
 
                 assert isinstance(hook, Hook)
-                try:
-                    result = ser.hydrate(
-                        data,
-                        what=f"the payload of hook {event.correlation_id}",
-                        key=self.run_key,
-                    )
-                except Exception as error:
-                    hook.set_error(error)
-                else:
-                    hook.set_result(result)
+                hook.receive_payload(data)
 
             case w.HookDisposedEvent():
                 self.hooks[event.correlation_id].has_dispose_event = True
