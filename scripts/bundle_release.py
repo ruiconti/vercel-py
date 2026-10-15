@@ -60,6 +60,7 @@ SHARED_VENDORED_LIBS = {
 SHARED_VENDORED_REQUIREMENTS = tuple(SHARED_VENDORED_LIBS.values())
 SHARED_VENDORED_CONSUMERS = {
     "vercel-apscheduler",
+    "vercel-blob",
     "vercel-cache",
     "vercel-celery",
     "vercel-connect",
@@ -85,6 +86,7 @@ EXTERNAL_DEPENDENCIES = {
     # Pydantic's runtime graph includes the platform-specific pydantic-core
     # extension. Keep the ordinary bounded dependency instead of producing a
     # bundle that contains only Pydantic's Python sources.
+    "vercel-blob": {"pydantic"},
     "vercel-sandbox": {"pydantic"},
     # Same for Pydantic here. `cryptography` needs no entry: it arrives through
     # the `vercel-oidc[verify]` extra rather than this package's own table, and

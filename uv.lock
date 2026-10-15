@@ -20,6 +20,7 @@ lograil = "2026-08-21T00:00:00Z"
 members = [
     "vercel",
     "vercel-apscheduler",
+    "vercel-blob",
     "vercel-cache",
     "vercel-celery",
     "vercel-connect",
@@ -2633,6 +2634,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "vercel-blob" },
     { name = "vercel-cache" },
     { name = "vercel-headers" },
     { name = "vercel-internal-core" },
@@ -2651,6 +2653,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7.0,<3" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.0.0,<5" },
+    { name = "vercel-blob", editable = "src/vercel-blob" },
     { name = "vercel-cache", editable = "src/vercel-cache" },
     { name = "vercel-headers", editable = "src/vercel-headers" },
     { name = "vercel-internal-core", editable = "src/vercel-internal-core" },
@@ -2676,6 +2679,26 @@ requires-dist = [
     { name = "apscheduler", specifier = ">=3.10.4,<4" },
     { name = "vercel-cache", editable = "src/vercel-cache" },
     { name = "vercel-queue", editable = "src/vercel-queue" },
+]
+
+[[package]]
+name = "vercel-blob"
+source = { editable = "src/vercel-blob" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "pydantic" },
+    { name = "vercel-internal-core" },
+    { name = "vercel-oidc" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.0.0,<5" },
+    { name = "httpx2", specifier = ">=2" },
+    { name = "pydantic", specifier = ">=2.7.0,<3" },
+    { name = "vercel-internal-core", editable = "src/vercel-internal-core" },
+    { name = "vercel-oidc", editable = "src/vercel-oidc" },
 ]
 
 [[package]]
