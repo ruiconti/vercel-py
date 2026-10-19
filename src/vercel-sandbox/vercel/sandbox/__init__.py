@@ -56,6 +56,7 @@ from vercel.sandbox._internal.errors import (
     SandboxTerminalStateError,
     SandboxTimeoutError as SandboxTimeoutError,
     SandboxUploadSizeMismatchError,
+    SandboxUserAlreadyExistsError,
 )
 from vercel.sandbox._internal.models import (
     CompletedProcess,
@@ -112,6 +113,13 @@ from vercel.sandbox._internal.options import (
 from vercel.sandbox._internal.service import SandboxService, get_sandbox_service
 from vercel.sandbox._internal.state import SnapshotRetentionState
 from vercel.sandbox._internal.text_reader import TextReader
+from vercel.sandbox.protocols import (
+    SandboxExecution,
+    SandboxFilesystemOperations,
+    SyncSandboxExecution,
+    SyncSandboxFilesystemOperations,
+)
+from vercel.sandbox.user import SandboxUser
 
 from . import sync
 from .client import SandboxClient
@@ -611,6 +619,11 @@ async def get_snapshot(*, snapshot_id: str) -> Snapshot:
 
 
 __all__ = [
+    "SandboxUser",
+    "SandboxExecution",
+    "SandboxFilesystemOperations",
+    "SyncSandboxExecution",
+    "SyncSandboxFilesystemOperations",
     "SandboxBinaryReader",
     "SandboxBinaryWriter",
     "SandboxClient",
@@ -650,6 +663,7 @@ __all__ = [
     "SandboxInvalidHandleError",
     "SandboxPathNotFoundError",
     "SandboxUploadSizeMismatchError",
+    "SandboxUserAlreadyExistsError",
     "NetworkPolicy",
     "NetworkPolicyForwardRuleSummary",
     "NetworkPolicyInjectionRuleSummary",

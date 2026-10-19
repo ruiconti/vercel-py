@@ -352,3 +352,101 @@ session scope.
 Managed sandbox and session exit does not wait for concurrent operations.
 Callers must join sandbox work before leaving a context when deterministic
 cleanup is required.
+
+## Isolated users and shared capabilities
+
+Create a Linux account with a private home directory, or select an existing
+account without creating it:
+
+```python
+alice = await instance.create_user("alice")
+bob = instance.as_user("bob")  # Synchronous selection, including on the async API
+
+await alice.fs.write_text("secret.txt", "private", mode=0o600)
+result = await alice.run_process("whoami", capture_output=True, check=True)
+assert result.stdout == "alice\n"
+assert alice.home_dir == "/home/alice"
+```
+
+`SandboxUser` and `SyncSandboxUser` are immutable handles exposing `username`,
+`home_dir`, `run_process()`, `create_process()`, and `.fs`. Their command and
+filesystem options match the session APIs. Usernames must match
+`[a-z_][a-z0-9_-]*` and contain at most 32 characters; invalid names fail
+immediately. `create_user()` raises `SandboxUserAlreadyExistsError` if the account
+already exists. Catch it and pass its `username` to `as_user()` to select that
+account. Other provisioning failures, including occupied home paths, raise
+`SandboxError`. Successful creation provisions
+`/bin/bash` and `/home/<username>` owned by the user and the sandbox default
+group with mode `0770`, and returns a handle.
+It rejects existing home paths, including symlinks, before creating an account.
+`as_user()` performs no I/O. It resolves the actual existing account's home
+on first use, so `home_dir` is initially `None`, except for `root` (`/root`).
+A missing account fails on first use. Selecting an account never creates it.
+
+Commands preserve arguments without shell interpolation, initialize the
+account's UID, primary GID and supplementary groups, and set `HOME`, `USER`,
+and `LOGNAME`. Commands and relative filesystem paths default to the user's
+home; explicit relative `cwd` values also resolve against that home. Caller
+`env` entries override the defaults. `sudo=True` runs one command as root,
+with root's environment defaults, while retaining the handle's default cwd.
+Use `as_user("root")` for a persistent root identity.
+
+Commands, reads, listing, renaming, and removal run as the selected account
+and honor Linux permissions. Another user cannot read a private home.
+Uploads (`write_bytes`, `write_text`, batches, and writable `fs.open` handles)
+and `mkdir` are trusted SDK orchestration: they use the native HTTP filesystem
+API as the sandbox default account, then run privileged ownership commands.
+Upload contents never appear in command arguments. Successful uploads belong
+to the selected user and its actual primary group. Directories created by
+`mkdir`, and ancestors below the selected user's home, belong to that user
+and the sandbox default group with mode `0770` so later HTTP uploads can reach
+them. File access modes come from the upload request.
+
+These SDK write operations can access paths that the selected user's commands
+cannot, including another user's home when the HTTP account has access. Do not
+expose them as a filesystem permission boundary to untrusted callers. The HTTP
+account still needs access to the destination; existing accounts selected with
+`as_user()` retain their home ownership and permissions, so uploads may require
+explicit preparation. Failed uploads or ownership changes can leave partial
+files, and ownership is assigned only after the HTTP upload succeeds.
+
+User handles obtained from a sandbox follow its lazy resume; handles obtained
+from a runtime session stay pinned to that session. No lifecycle, configuration,
+or process lookup/listing methods are exposed by user handles. Group management
+is not included. Custom images need Bash with coprocess support, getent,
+useradd, setpriv with `--pdeathsig` support (util-linux), GNU find, and coreutils
+(including env's `--default-signal`), with setpriv, env, and sleep available
+under `/usr/bin`. User file reads use base64 command output to preserve binary
+contents; uploads stream through the native file endpoint. Command time limits
+and `KILL` clean up the command's process group inside the selected account so
+child processes release their output streams promptly. Catchable signals such
+as `INT`, `TERM`, and `USR1` allow command handlers to finish and report their
+actual exit status. As an intentional exception to the mirrored process API,
+user processes (including `sudo=True`) reject `STOP`, `TSTP`, `TTIN`, and `TTOU`
+with `NotImplementedError` before sending an API request. The launcher cannot
+safely pause the actual command's group; rejection leaves the command running
+and its process metadata intact. `CONT` remains accepted.
+
+The public `SandboxExecution` and `SandboxFilesystemOperations` Protocols
+support generic consumers of sandboxes, runtime sessions, and user handles:
+
+```python
+from vercel.sandbox import SandboxExecution
+
+async def run_agent(executor: SandboxExecution) -> str:
+    await executor.fs.write_text("input.txt", "hello")
+    result = await executor.run_process("cat", ["input.txt"], capture_output=True, check=True)
+    return result.stdout or ""
+
+await run_agent(instance)
+await run_agent(await instance.session())
+await run_agent(alice)
+```
+
+`SyncSandboxExecution` and `SyncSandboxFilesystemOperations` provide the same
+contracts for synchronous code and are exported from both `vercel.sandbox`
+and `vercel.sandbox.sync`. These structural Protocols cover command execution
+and filesystem operations only. See the executable
+[`sandbox_10_users.py`](examples/sandbox_10_users.py) example for generic
+consumers, command execution, and isolation using both APIs. The design follows
+Vercel's [multi-agent sandbox guide](https://vercel.com/docs/sandbox/concepts/multi-agent).
