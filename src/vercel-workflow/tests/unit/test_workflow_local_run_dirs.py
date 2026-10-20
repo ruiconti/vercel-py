@@ -130,3 +130,19 @@ async def test_a_symlinked_run_directory_is_refused(tmp_path, monkeypatch) -> No
     with pytest.raises(local_mod.UnsafeEntityIdError):
         await world.steps_get("wrun_A", "step_1")
     assert list(outside.iterdir()) == []
+
+
+def test_a_failed_wipe_fails_startup(tmp_path, monkeypatch) -> None:
+    (tmp_path / "events").mkdir()
+    (tmp_path / "events" / "wrun_old-evnt_1.json").write_text("{}")
+
+    def refuse(path, ignore_errors=False, **kwargs):
+        if ignore_errors:
+            return
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(local_mod.shutil, "rmtree", refuse)
+
+    with pytest.raises(PermissionError):
+        _world(tmp_path, monkeypatch)
+    assert (tmp_path / "events" / "wrun_old-evnt_1.json").is_file()
