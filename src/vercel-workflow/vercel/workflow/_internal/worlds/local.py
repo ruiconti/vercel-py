@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -420,6 +421,29 @@ def _inspect_entity_dirs(data_dir: pathlib.Path) -> tuple[list[str], list[str], 
     return flat, unrecognized, run_scoped
 
 
+def _remove_tree(path: pathlib.Path, attempts: int = 4) -> None:
+    """Delete ``path``, treating entries another process already removed as done.
+
+    Concurrent startups wipe the same directory, so a missing entry is not an
+    error; ``ENOTEMPTY`` means a writer raced the delete and is retried. Any
+    other error propagates: a partly deleted directory would leave flat history
+    that the per-run layout cannot read.
+    """
+
+    def ignore_missing(func: Any, failed: str, exc_info: Any) -> None:
+        if not isinstance(exc_info[1], FileNotFoundError):
+            raise exc_info[1]
+
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path, onerror=ignore_missing)
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY or attempt == attempts - 1:
+                raise
+        if not path.exists():
+            return
+
+
 def _wipe_flat_layout(data_dir: pathlib.Path) -> None:
     """Delete a data directory holding only old flat-layout data, refuse one
     that mixes layouts or holds unknown ``.json`` files.
@@ -437,9 +461,7 @@ def _wipe_flat_layout(data_dir: pathlib.Path) -> None:
         "it was written by an older version with an incompatible storage layout.",
         file=sys.stderr,
     )
-    # Errors propagate: a partly deleted directory would leave flat history
-    # that the per-run layout cannot read.
-    shutil.rmtree(data_dir)
+    _remove_tree(data_dir)
 
 
 class LocalWorld(w.World):
@@ -508,6 +530,9 @@ class LocalWorld(w.World):
 
     def _event_path(self, run_id: str, event_id: str) -> pathlib.Path:
         return self._run_dir("events", run_id) / f"{run_id}-{event_id}.json"
+
+    def _step_path(self, run_id: str, step_id: str) -> pathlib.Path:
+        return self._run_dir("steps", run_id) / f"{run_id}-{step_id}.json"
 
     def _hook_resume_claim_path(self, run_id: str, resume_id: str) -> pathlib.Path:
         key = hashlib.sha256(f"{run_id}\x00{resume_id}".encode()).hexdigest()
@@ -749,8 +774,7 @@ class LocalWorld(w.World):
         return run
 
     async def steps_get(self, run_id: str, step_id: str) -> w.WorkflowStep:
-        composite_key = f"{run_id}-{step_id}"
-        step_path = self._run_dir("steps", run_id) / f"{composite_key}.json"
+        step_path = self._step_path(run_id, step_id)
         step = read_json(step_path, w.WorkflowStepAdaptor)
         if step is None:
             raise RuntimeError(f"Step {step_id} not found in run {run_id}")
@@ -874,8 +898,7 @@ class LocalWorld(w.World):
                         "createdAt": now,
                     }
                 )
-                composite_key = f"{effective_run_id}-{event_id}"
-                event_path = self._run_dir("events", effective_run_id) / f"{composite_key}.json"
+                event_path = self._event_path(effective_run_id, event_id)
                 write_json(event_path, event_record(event))
                 return w.EventResult(event=event, run=current_run)
 
@@ -897,8 +920,7 @@ class LocalWorld(w.World):
         validated_step: w.WorkflowStep | None = None
         step_events = ["step_started", "step_completed", "step_failed", "step_retrying"]
         if data.event_type in step_events and data.correlation_id:
-            step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-            step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
+            step_path = self._step_path(effective_run_id, data.correlation_id)
             validated_step = read_json(step_path, w.WorkflowStepAdaptor)
 
             if not validated_step:
@@ -1131,8 +1153,7 @@ class LocalWorld(w.World):
                 updated_at=now,
                 spec_version=data.spec_version,
             )
-            step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-            step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
+            step_path = self._step_path(effective_run_id, data.correlation_id)
             write_json(step_path, step)
 
         elif data.event_type == "step_started":
@@ -1144,8 +1165,6 @@ class LocalWorld(w.World):
                         retry_after=math.ceil((validated_step.retry_after - now).total_seconds()),
                     )
 
-                step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-                step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
                 step = w.NonFinalWorkflowStep.from_wire(
                     validated_step.model_dump()
                     | {
@@ -1160,8 +1179,6 @@ class LocalWorld(w.World):
 
         elif data.event_type == "step_completed":
             if validated_step:
-                step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-                step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
                 step = w.CompletedWorkflowStep.from_wire(
                     validated_step.model_dump()
                     | {
@@ -1176,8 +1193,6 @@ class LocalWorld(w.World):
         elif data.event_type == "step_retrying":
             retrying_data = data.event_data
             if validated_step:
-                step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-                step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
                 step = w.NonFinalWorkflowStep.from_wire(
                     validated_step.model_dump()
                     | {
@@ -1192,8 +1207,6 @@ class LocalWorld(w.World):
         elif data.event_type == "step_failed":
             step_failed_data = data.event_data
             if validated_step:
-                step_composite_key = f"{effective_run_id}-{data.correlation_id}"
-                step_path = self._run_dir("steps", effective_run_id) / f"{step_composite_key}.json"
                 step = w.FailedWorkflowStep.from_wire(
                     validated_step.model_dump()
                     | {
@@ -1251,8 +1264,7 @@ class LocalWorld(w.World):
                     ),
                 )
                 assert conflict_event.server_props is not None
-                composite_key = f"{effective_run_id}-{event_id}"
-                event_path = self._run_dir("events", effective_run_id) / f"{composite_key}.json"
+                event_path = self._event_path(effective_run_id, event_id)
                 write_json(event_path, event_record(conflict_event))
                 return w.EventResult(
                     event=conflict_event,
@@ -1306,8 +1318,7 @@ class LocalWorld(w.World):
                 disposed_constraint_path.unlink(missing_ok=True)
             hook_path.unlink(missing_ok=True)
 
-        composite_key = f"{effective_run_id}-{event_id}"
-        event_path = self._run_dir("events", effective_run_id) / f"{composite_key}.json"
+        event_path = self._event_path(effective_run_id, event_id)
         write_json(event_path, event_record(event))
 
         return w.EventResult(

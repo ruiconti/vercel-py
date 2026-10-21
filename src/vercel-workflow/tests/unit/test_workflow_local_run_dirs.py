@@ -8,6 +8,7 @@ layouts or holds unknown ``.json`` files is refused and left alone.
 
 from __future__ import annotations
 
+import errno
 import json
 
 import pytest
@@ -146,3 +147,54 @@ def test_a_failed_wipe_fails_startup(tmp_path, monkeypatch) -> None:
     with pytest.raises(PermissionError):
         _world(tmp_path, monkeypatch)
     assert (tmp_path / "events" / "wrun_old-evnt_1.json").is_file()
+
+
+def _flat_dir(tmp_path) -> None:
+    (tmp_path / "events").mkdir()
+    (tmp_path / "events" / "wrun_old-evnt_1.json").write_text("{}")
+
+
+def test_wiping_an_already_wiped_directory_succeeds(tmp_path) -> None:
+    _flat_dir(tmp_path)
+
+    local_mod._wipe_flat_layout(tmp_path)
+    local_mod._wipe_flat_layout(tmp_path)
+    local_mod._remove_tree(tmp_path)
+
+    assert not tmp_path.exists()
+
+
+def test_an_entry_removed_by_another_process_mid_wipe_is_not_an_error(
+    tmp_path, monkeypatch
+) -> None:
+    _flat_dir(tmp_path)
+    real_unlink = local_mod.os.unlink
+
+    def lose_race(path, *args, **kwargs):
+        real_unlink(path, *args, **kwargs)
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(local_mod.os, "unlink", lose_race)
+
+    local_mod._wipe_flat_layout(tmp_path)
+
+    assert not tmp_path.exists()
+
+
+def test_a_wipe_retries_when_a_writer_races_the_delete(tmp_path, monkeypatch) -> None:
+    _flat_dir(tmp_path)
+    real_rmtree = local_mod.shutil.rmtree
+    calls = []
+
+    def flaky(path, **kwargs):
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+        real_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(local_mod.shutil, "rmtree", flaky)
+
+    local_mod._wipe_flat_layout(tmp_path)
+
+    assert len(calls) == 2
+    assert not tmp_path.exists()
